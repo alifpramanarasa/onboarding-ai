@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "onboarding-ai"
+version = "0.1.0"
+description = "AI-powered onboarding assistant for procurement"
+authors = ["Your Name <your@email.com>"]
+license = "MIT"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.11"
+fastapi = "^0.109.0"
+uvicorn = "^0.27.0"
+spacy = "^3.7.2"
+openai = "^1.10.0"
+langchain = "^0.1.0"
+langchain-openai = "^0.0.5"
+langchain-community = "^0.0.10"
+redis = "^5.0.1"
+pydantic = "^2.6.3"
+
+[tool.poetry.group.dev.dependencies]  # Updated dev dependencies structure
+pytest = "^7.4.3"
+black = "^23.12.0"
+isort = "^5.12.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
