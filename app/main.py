@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import spacy
 import openai
 import redis
 import json
@@ -8,7 +7,6 @@ from langchain_openai import ChatOpenAI
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-nlp = spacy.load("en_core_web_sm")  # NLP model
 
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
@@ -17,33 +15,19 @@ redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=T
 openai.api_key = ""
 llm = ChatOpenAI(model="gpt-4", openai_api_key=openai.api_key)
 
-# Define form steps
+# Define form steps - Simplified and conditional
 FORM_STEPS = [
     "companyDetails",
     "procurementIntent",
-    "roomPlanning",
-    "scopeComplexity",
+    "roomPlanning",  # Optional - only for fulfillment
+    "requirementDetails",
+    "procurementModel",
     "budgetTimeline",
-    "selectedServiceId",
-    "additionalSpecs"
+    "additionalInfo"
 ]
 
-VALID_CUSTOMER_TYPES = ["company", "home", "villa", "office", "personal"]
-VALID_ROLE_TYPES = ["primary", "agent", "other"]
-VALID_PROJECT_TYPES = ["one-off", "recurring", "project-based", "tender"]
-
-# Add this with the other constants near the top of the file
-VALID_FURNITURE_ITEMS = [
-    "sofa", "chair", "table", "desk", "bed", "cabinet", "vase", "lamp", "shelf",
-    "wardrobe", "dresser", "mirror", "rug", "carpet", "curtain", "bookcase",
-    "sideboard", "ottoman", "stool", "bench", "dining set", "coffee table"
-]
-
-# Add this with the other constants at the top
-VALID_ROOM_TYPES = [
-    "bedroom", "living room", "dining room", "kitchen", "bathroom",
-    "office", "study", "guest room", "master bedroom", "family room"
-]
+# Define which steps are optional
+OPTIONAL_STEPS = {"roomPlanning", "additionalInfo"}
 
 # Add CORS middleware
 app.add_middleware(
@@ -58,269 +42,319 @@ class UserInput(BaseModel):
     conversation_id: str
     message: str
 
-
 @app.post("/chat/")
 async def chat(input_data: UserInput):
-    """
-    Handles user input, extracts structured data, and determines the next step in conversation.
-    """
     conversation_id = input_data.conversation_id
     user_message = input_data.message
 
-    # Step 1: Load conversation history from Redis
     conversation_data = get_conversation(conversation_id)
-
-    # Step 2: Determine current step
     current_step = conversation_data.get("current_step", FORM_STEPS[0])
 
-    # Step 3: Extract relevant data from user input
-    current_step_data = conversation_data.get(current_step, {})
-    extracted_data = extract_fields(user_message, current_step, current_step_data)
-    print("extracted_data", extracted_data)
-    conversation_data[current_step] = {**current_step_data, **extracted_data}
+    print(f"Before extraction - Conversation data: {conversation_data}")
     
-    # Step 4: Store updated conversation in Redis
+    current_step_data = conversation_data.get(current_step, {})
+    extracted_data = extract_fields_ai(user_message, current_step)
+    
+    print(f"Extracted data: {extracted_data}")
+    
+    # Ensure we're not nesting data under the step name again
+    if current_step in extracted_data:
+        extracted_data = extracted_data[current_step]
+    
+    conversation_data[current_step] = merge_step_data(current_step_data, extracted_data)
+    
+    print(f"After update - Conversation data: {conversation_data}")
+    
     save_conversation(conversation_id, conversation_data)
 
-    # Step 5: Check if all required fields for current step are filled
     if is_step_complete(conversation_data[current_step], current_step):
         next_step = get_next_step(current_step, conversation_data)
         conversation_data["current_step"] = next_step
         save_conversation(conversation_id, conversation_data)
 
         if next_step:
-            ai_question = generate_followup_question(next_step, conversation_data)
+            ai_question = generate_followup_question_ai(next_step, conversation_data)
             return {"response": ai_question, "form_data": conversation_data}
-
         return {"response": "All steps completed!", "form_data": conversation_data}
 
-    # Step 6: Generate a follow-up question for missing fields
     next_field = get_next_missing_field(conversation_data[current_step], current_step)
-    ai_question = generate_followup_question(next_field, conversation_data)
-
+    ai_question = generate_followup_question_ai(next_field, conversation_data)
     return {"response": ai_question, "form_data": conversation_data}
 
 
-def extract_fields(text: str, step: str, step_data: dict):
+def extract_fields_ai(text: str, step: str):
+    system_prompt = """You are a helpful assistant that extracts structured data from user input. 
+    Always respond with valid JSON only. No other text or explanation.
+    Only include fields that you can extract from the text - do not include fields with null values.
+    Only extract fields relevant to the current step.
+    
+    For customerType:
+    - If mentioning personal property (house, villa, apartment, home) → set customerType to "personal"
+    - If mentioning business (office, company, corporate, hotel) → set customerType to "business"
+    
+    For procurementIntent:
+    - If user mentions "3" or "full project" or "fulfill" → set type to "fulfillment"
+    - If user mentions "1" or "purchase products" → set type to "product"
+    - If user mentions "2" or "services" → set type to "service"
+    
+    For requirementDetails:
+    - Extract mentioned items and quantities into an array
+    - Format: {"requirements": ["2 sofa", "1 table", "3 chairs"]}
+    
+    For procurementModel:
+    - "one-off", "single", "1" → set model to "one-off"
+    - "recurring", "regular", "2" → set model to "recurring"
+    - "project", "project-based", "3" → set model to "project-based"
+    - "tender", "bid", "4" → set model to "tender"
     """
-    Extracts structured data using NLP (spaCy) based on the current form step.
-    """
-    doc = nlp(text.lower())
-    structured_data = {}
+    
+    step_fields = {
+        "companyDetails": ["customerType", "name", "location"],
+        "procurementIntent": ["type"],
+        "roomPlanning": ["rooms"],
+        "requirementDetails": ["requirements"],
+        "procurementModel": ["model"],
+        "budgetTimeline": ["budget", "timeline"],
+        "additionalInfo": ["additional"]
+    }
+    
+    user_prompt = f"""Extract ONLY the following fields for the current step '{step}': {', '.join(step_fields.get(step, []))}
+    
+    Text to analyze: {text}
+    Current conversation step: {step}
+    
+    Rules:
+    - Only extract fields listed above for the current step
+    - For requirementDetails, extract items with quantities as an array
+    - Example for requirements: {{"requirements": ["2 sofa", "1 table", "4 chairs"]}}
+    - Only include fields you can confidently extract
+    - Do not include fields with null values
+    - Do not nest the response inside the step name
+    
+    Return only the JSON object with the extracted values for this step."""
 
-    if step == "companyDetails":
-        # Use the passed step_data instead of creating an empty dict
-        next_field = get_next_missing_field(step_data, step)
-        print("next_field", next_field)
+    try:
+        response = llm.predict(system_prompt + "\n" + user_prompt)
+        response = response.strip()
+        if response.startswith('```json'):
+            response = response.split('```json')[1]
+        if response.endswith('```'):
+            response = response[:-3]
+        response = response.strip()
         
-        if next_field == "customerType":
-            # Only look for customer type when specifically asking for it
-            for token in doc:
-                if token.text in VALID_CUSTOMER_TYPES:
-                    structured_data["customerType"] = token.text
-            if "company" in text:
-                structured_data["customerType"] = "company"
+        parsed_data = json.loads(response) if response else {}
         
-        elif next_field == "name":
-            structured_data["name"] = text.strip()
-        
-        elif next_field == "location":
-            structured_data["location"] = text.strip()
-        
-        elif next_field == "role":
-            for token in doc:
-                if token.text in VALID_ROLE_TYPES:
-                    structured_data["role"] = token.text
-
-    elif step == "procurementIntent":
-        # Extract furniture items mentioned in the text
-        furniture_items = []
-        current_quantity = 1
-        
-        # Dictionary to convert word numbers to integers
-        word_to_number = {
-            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
-            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10
-        }
-        
-        # Keep track of potential furniture items not in our list
-        unknown_items = []
-        
-        for token in doc:
-            # Check for numbers (both words and digits)
-            if token.like_num:
-                try:
-                    current_quantity = int(token.text)
-                except ValueError:
-                    if token.text in word_to_number:
-                        current_quantity = word_to_number[token.text]
-            # Check for furniture items
-            elif token.text in VALID_FURNITURE_ITEMS:
-                furniture_items.append({"item": token.text, "quantity": current_quantity})
-                current_quantity = 1  # Reset quantity
-            # If not a number and not in our list, might be a furniture item
-            elif token.pos_ in ['NOUN', 'PROPN']:  # Only consider nouns
-                unknown_items.append(token.text)
-        
-        # If we found unknown items, ask AI if they're furniture
-        if unknown_items:
-            prompt = f"Are any of these items furniture or home decor items? Please respond with only the items that are furniture/decor in a Python list format: {unknown_items}"
-            response = llm.predict(prompt)
-            try:
-                # Try to safely evaluate the response as a Python list
-                ai_validated_items = eval(response.strip())
-                if isinstance(ai_validated_items, list):
-                    for item in ai_validated_items:
-                        furniture_items.append({"item": item, "quantity": current_quantity})
-                        current_quantity = 1
-            except:
-                # If eval fails, just continue with what we have
-                pass
-        
-        if furniture_items:
-            structured_data["offerings"] = furniture_items
-
-    elif step == "roomPlanning":
-        room_info = {}
-        dimensions = []
-        
-        # Extract room type
-        for token in doc:
-            if token.text in VALID_ROOM_TYPES:
-                room_info["type"] = token.text
-        
-        # Extract dimensions
-        numbers = []
-        for token in doc:
-            if token.like_num:
-                try:
-                    numbers.append(float(token.text))
-                except ValueError:
-                    continue
-        
-        # If we found two numbers, assume they're dimensions
-        if len(numbers) >= 2:
-            room_info["dimensions"] = {
-                "length": numbers[0],
-                "width": numbers[1],
-                "unit": "meters"  # Default unit, could be made more sophisticated
-            }
-            room_info["area"] = numbers[0] * numbers[1]
-        
-        if room_info:
-            structured_data["rooms"] = [room_info]
-
-    elif step == "scopeComplexity":
-        # Extract style and specifications
-        style_info = {}
-        
-        # Try to extract overall style if mentioned
-        style_keywords = ["modern", "traditional", "contemporary", "classic", "minimalist", "rustic"]
-        for token in doc:
-            if token.text in style_keywords:
-                style_info["style"] = token.text
-        
-        # Use AI to extract detailed specifications
-        prompt = f"Extract furniture specifications from this text and return as a Python dictionary with 'specifications' key containing a list of specs: {text}"
-        response = llm.predict(prompt)
-        try:
-            specs_dict = eval(response.strip())
-            if isinstance(specs_dict, dict) and "specifications" in specs_dict:
-                style_info["specifications"] = specs_dict["specifications"]
-        except:
-            # If eval fails, store the raw text as type
-            style_info["type"] = text.strip()
-        
-        if style_info:
-            structured_data.update(style_info)
-
-    elif step == "budgetTimeline":
-        # Extract budget and timeline information
-        budget_info = {}
-        
-        # Extract numbers for budget
-        numbers = []
-        currency = None
-        for token in doc:
-            if token.like_num:
-                try:
-                    numbers.append(float(token.text))
-                except ValueError:
-                    continue
-            # Look for currency indicators
-            if token.text in ["rupiah", "idr", "rp", "million", "juta"]:
-                currency = token.text
-
-        # Extract timeline
-        timeline_words = ["day", "days", "week", "weeks", "month", "months", "year", "years"]
-        timeline = None
-        timeline_unit = None
-        
-        for i, token in enumerate(doc):
-            if token.text in timeline_words:
-                # Look for number before the time unit
-                for j in range(max(0, i-3), i):
-                    if doc[j].like_num:
-                        try:
-                            timeline = float(doc[j].text)
-                            timeline_unit = token.text
-                            break
-                        except ValueError:
-                            continue
-        
-        if numbers and currency:
-            budget_info["budget"] = {
-                "amount": numbers[0],
-                "currency": currency
-            }
+        # Handle special cases for each step
+        if step == "requirementDetails":
+            # Ensure requirements is an array
+            if "requirements" in parsed_data and not isinstance(parsed_data["requirements"], list):
+                if isinstance(parsed_data["requirements"], dict):
+                    # Clean up nested data
+                    parsed_data = {"requirements": []}
+                else:
+                    parsed_data["requirements"] = [parsed_data["requirements"]]
             
-        if timeline and timeline_unit:
-            budget_info["timeline"] = {
-                "duration": timeline,
-                "unit": timeline_unit
-            }
-            
-        if budget_info:
-            structured_data.update(budget_info)
-
-    return structured_data
+            # Extract items from text if not already extracted
+            if "requirements" not in parsed_data:
+                items = []
+                text_lower = text.lower()
+                # Look for patterns like "2 sofa" or "three chairs"
+                words = text_lower.split()
+                for i in range(len(words)-1):
+                    if words[i].isdigit() or words[i] in ["one", "two", "three", "four", "five"]:
+                        items.append(f"{words[i]} {words[i+1]}")
+                if items:
+                    parsed_data["requirements"] = items
+        
+        # Clean up any nested data
+        if "procurementIntent" in parsed_data:
+            del parsed_data["procurementIntent"]
+        if "customerType" in parsed_data and step != "companyDetails":
+            del parsed_data["customerType"]
+        
+        # Ensure we're not nesting data unnecessarily
+        if step in parsed_data:
+            return parsed_data[step]
+        return parsed_data
+        
+    except Exception as e:
+        print(f"Error in extract_fields_ai: {str(e)}")
+        return {}
 
 
 def is_step_complete(step_data: dict, step: str):
-    """
-    Checks if all required fields for a step are filled.
-    """
+    if step in OPTIONAL_STEPS:
+        return True
+        
     required_fields = {
-        "companyDetails": ["customerType", "name", "location", "role"],
-        "procurementIntent": ["offerings"],
+        "companyDetails": ["customerType", "name", "location"],
+        "procurementIntent": ["type"],
         "roomPlanning": ["rooms"],
-        "scopeComplexity": ["type"],
+        "requirementDetails": ["requirements"],
+        "procurementModel": ["model"],
         "budgetTimeline": ["budget", "timeline"]
     }
+    
     for field in required_fields.get(step, []):
-        if field not in step_data:
+        if field not in step_data or step_data[field] is None:
             return False
     return True
 
 
+def generate_followup_question_ai(field: str, conversation_data: dict):
+    field_questions = {
+        "customerType": "Can you please specify if you are seeking our services for personal use or for a business?",
+        "name": "What is your name?",
+        "location": "What is your location?",
+        "type": "Would you like to: \n1. Purchase specific products\n2. Get specific services\n3. Get full project fulfillment (furnishing entire spaces)",
+        "rooms": "Which rooms would you like us to furnish? Please list all rooms that need furnishing.",
+        "requirements": """Please list all items you need with quantities. For example:
+Living Room:
+- 2 three-seater sofas
+- 4 accent chairs
+- 1 coffee table
+- 2 side tables
+- 1 TV cabinet
+- 1 area rug
+
+Bedroom:
+- 1 king-size bed
+- 2 bedside tables
+- 1 wardrobe
+- 1 dresser
+- 1 vanity set
+
+Please provide your list in a similar format.""",
+        "model": "How would you like to proceed with the purchase?\n1. One-off purchase (single transaction)\n2. Recurring order (regular purchases)\n3. Project-based (complete project management)\n4. Tender (competitive bidding)",
+        "budget": "What is your budget range for this project? Please specify in your local currency.",
+        "timeline": "When would you like this project to be completed? Please specify both preferred start date and completion deadline.",
+        "additional": """Do you have any specific requirements for:
+1. Style preferences (modern, classic, minimalist, etc.)
+2. Color schemes
+3. Material preferences (wood type, fabric, etc.)
+4. Brand preferences
+5. Any specific features needed
+6. Installation requirements
+Please provide as much detail as possible."""
+    }
+    
+    if field in field_questions:
+        # Customize questions based on context
+        if field == "type" and "villa" in str(conversation_data).lower():
+            return "I understand you want to furnish your villa. Would you like:\n1. To purchase specific furniture items\n2. Full project fulfillment (we handle everything)"
+        
+        if field == "rooms" and "hotel" in str(conversation_data).lower():
+            return """Which hotel areas need furnishing? Please list all areas, such as:
+- Guest rooms (specify number of rooms)
+- Lobby
+- Reception area
+- Restaurant/Dining area
+- Conference rooms
+- Business center
+- Spa/Gym
+- Other facilities
+
+Please list all areas that need furnishing."""
+            
+        if field == "requirements":
+            intent_type = conversation_data.get("procurementIntent", {}).get("type")
+            rooms = conversation_data.get("roomPlanning", {}).get("rooms", [])
+            
+            if intent_type == "fulfillment":
+                if "hotel" in str(conversation_data).lower():
+                    return """Please list all furniture and items needed for each area. For example:
+
+Guest Rooms (per room):
+- 1 king/queen bed
+- 2 bedside tables
+- 1 work desk with chair
+- 1 lounge chair
+- 1 TV with mount
+- 1 minibar cabinet
+- 1 wardrobe
+- 1 luggage rack
+
+Lobby:
+- Seating arrangements
+- Reception counter
+- Decorative items
+
+Please list all items needed with quantities for each area."""
+                else:
+                    room_prompts = "\n\n".join([f"{room}:\n- Furniture items needed\n- Lighting requirements\n- Storage solutions\n- Decorative elements" for room in rooms]) if rooms else ""
+                    return f"""Please list all furniture and items needed for each room with quantities. Be as specific as possible with sizes and any special requirements.
+
+{room_prompts if room_prompts else 'Please list by room:'}"""
+            elif intent_type == "product":
+                return """Please list all products you want to purchase with:
+- Exact quantities
+- Preferred dimensions (if applicable)
+- Specific materials (if any preference)
+- Color preferences
+- Any other specific requirements"""
+            elif intent_type == "service":
+                return """What specific services do you need? Please specify:
+- Type of service (design, installation, maintenance, etc.)
+- Scope of work
+- Specific requirements
+- Service frequency (if applicable)"""
+                
+        if field == "budget":
+            intent_type = conversation_data.get("procurementIntent", {}).get("type")
+            if intent_type == "fulfillment":
+                return """What is your total budget for this furnishing project?
+Please specify:
+- Total budget range
+- Any specific allocation for different areas
+- Whether this includes installation and delivery
+- Any other cost considerations"""
+            elif intent_type == "product":
+                return "What is your budget range for these products? Please include any delivery or installation requirements in your budget consideration."
+            elif intent_type == "service":
+                return "What is your budget allocation for these services? Please specify if this is a one-time budget or recurring budget."
+                
+        return field_questions[field]
+    
+    return "Could you please provide more details about your requirements?"
+
+
+def get_conversation(conversation_id: str):
+    data = redis_client.get(conversation_id)
+    return json.loads(data) if data else {"current_step": FORM_STEPS[0]}
+
+
+def save_conversation(conversation_id: str, conversation_data: dict):
+    redis_client.set(conversation_id, json.dumps(conversation_data))
+
+
 def get_next_step(current_step: str, conversation_data: dict):
-    """
-    Determines the next step in the conversation flow.
-    """
     current_index = FORM_STEPS.index(current_step)
-    if current_index + 1 < len(FORM_STEPS):
-        return FORM_STEPS[current_index + 1]
+    while current_index + 1 < len(FORM_STEPS):
+        next_step = FORM_STEPS[current_index + 1]
+        
+        # Skip roomPlanning if not fulfillment
+        if next_step == "roomPlanning":
+            procurement_type = conversation_data.get("procurementIntent", {}).get("type")
+            if procurement_type != "fulfillment":
+                current_index += 1
+                continue
+                
+        # Skip optional steps if no data provided
+        if next_step in OPTIONAL_STEPS and next_step not in conversation_data:
+            current_index += 1
+            continue
+            
+        return next_step
     return None
 
 
 def get_next_missing_field(step_data: dict, step: str):
-    """
-    Identifies the next missing field for the current step.
-    """
     required_fields = {
-        "companyDetails": ["customerType", "name", "location", "role"],
-        "procurementIntent": ["offerings"],
-        "scopeComplexity": ["type"],
+        "companyDetails": ["customerType", "name", "location"],
+        "procurementIntent": ["type"],
+        "roomPlanning": ["rooms"],
+        "requirementDetails": ["requirements"],
+        "procurementModel": ["model"],
         "budgetTimeline": ["budget", "timeline"]
     }
     for field in required_fields.get(step, []):
@@ -328,37 +362,18 @@ def get_next_missing_field(step_data: dict, step: str):
             return field
     return None
 
-
-def generate_followup_question(field: str, conversation_data: dict):
-    """
-    Uses AI to generate a follow-up question based on missing fields.
-    """
-    prompt = f"User has provided {conversation_data}. What is a good follow-up question to ask about {field}?"
-    response = llm.predict(prompt)
-    return response
-
-
-# Redis Helpers
-def get_conversation(conversation_id: str):
-    """
-    Retrieves conversation data from Redis.
-    """
-    data = redis_client.get(conversation_id)
-    print(data)
-    return json.loads(data) if data else {"current_step": FORM_STEPS[0]}
-
-
-def save_conversation(conversation_id: str, conversation_data: dict):
-    """
-    Saves conversation data to Redis.
-    """
-    redis_client.set(conversation_id, json.dumps(conversation_data))
-
-
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def merge_step_data(existing_data: dict, new_data: dict) -> dict:
+    """Merge new data with existing data, preserving non-null existing values."""
+    result = existing_data.copy()
+    
+    # Remove any fields that shouldn't be in this step
+    if "procurementIntent" in result and "type" not in result["procurementIntent"]:
+        del result["procurementIntent"]
+    
+    for key, value in new_data.items():
+        # Only update if the new value is not None and either:
+        # 1. The key doesn't exist in result, or
+        # 2. The existing value is None
+        if value is not None and (key not in result or result[key] is None):
+            result[key] = value
+    return result
